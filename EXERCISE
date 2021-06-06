@@ -1,0 +1,225 @@
+# 實驗：遷移學習範例
+
+<table class="tfo-notebook-buttons" align="left">
+  <td>
+    <a target="_blank" href="https://colab.research.google.com/github/taipeitechmmslab/MMSLAB-TF2/blob/master/Lab9.ipynb"><img src="https://www.tensorflow.org/images/colab_logo_32px.png" />Run in Google Colab</a>
+  </td>
+  <td>
+    <a target="_blank" href="https://github.com/taipeitechmmslab/MMSLAB-TF2/blob/master/Lab9.ipynb"><img src="https://www.tensorflow.org/images/GitHub-Mark-32px.png" />View source on GitHub</a>
+  </td>
+</table>
+
+### Import必要套件
+
+import os
+import numpy as np
+import tensorflow as tf
+import tensorflow_hub as hub
+import tensorflow_datasets as tfds
+from tensorflow import keras
+from tensorflow.keras import layers
+import matplotlib.pyplot as plt
+# 從資料夾中的preprocessing.py檔案中Import flip, color, rotate, zoom影像增強函數
+from preprocessing import flip, color, rotate, zoom
+
+### 讀取數據並分析
+
+### cats_vs_dogs
+載入cats_vs_dogs數據集
+
+# 將train Data重新分成8:1:1等分，分別分給train data, valid data, test data
+train_split, valid_split, test_split = ['train[:80%]', 'train[80%:90%]', 'train[90%:]']
+# 取得訓練數據，並順便讀取data的資訊
+train_data, info = tfds.load("cats_vs_dogs", split=train_split, with_info=True)
+# 取得驗證數據
+valid_data = tfds.load("cats_vs_dogs", split=valid_split)
+# 取得測試數據
+test_data = tfds.load("cats_vs_dogs", split=test_split)
+
+查看標籤類別，並建立解碼器：
+
+print(info.features['label'].names)
+decoder = info.features['label'].names
+
+顯示數據集部分影像資料：
+
+# 每一次取8比資料，共取8次，所以總共取得64比資料
+for data in train_data.take(1):
+    img = data['image']
+    label = data['label']
+plt.title(decoder[label])
+# 顯示影像
+plt.imshow(img)
+
+### Dataset 設定
+資料預處理(Data Prepossessing )
+
+訓練資料:
+-	標準化：將影像全部除以255，將像素值縮放到0~1之間。
+-	影像增強：將影像水平翻轉、影像旋轉、顏色轉換和影像縮放。
+-	調整影像大小：將輸入影像調整為網路模型要求格式(299, 299, 3)。
+
+驗證和測試資料:
+-	標準化：將影像全部除以255，將像素值縮放到0~1之間。
+-	調整影像大小：將輸入影像調整為網路模型要求格式(299, 299, 3)。
+
+
+input_shape = (299, 299)
+
+def parse_aug_fn(dataset):
+    """
+    Image Augmentation(影像增強) function
+    """
+    x = tf.cast(dataset['image'], tf.float32) / 255.  # 影像標準化
+    x = tf.image.resize(x, input_shape)
+    x = flip(x)  # 隨機水平翻轉
+    # 觸發顏色轉換機率50%
+    x = tf.cond(tf.random.uniform([], 0, 1) > 0.5, lambda: color(x), lambda: x)
+    # 觸發影像旋轉機率0.25%
+    x = tf.cond(tf.random.uniform([], 0, 1) > 0.75, lambda: rotate(x), lambda: x)
+    # 觸發影像縮放機率50%
+    x = tf.cond(tf.random.uniform([], 0, 1) > 0.5, lambda: zoom(x), lambda: x)
+    return x, dataset['label']
+
+def parse_fn(dataset):
+    x = tf.cast(dataset['image'], tf.float32) / 255.  # 影像標準化
+    x = tf.image.resize(x, input_shape)
+    return x, dataset['label']
+
+Dataset設定：
+
+AUTOTUNE = tf.data.experimental.AUTOTUNE  # 自動調整模式
+buffer_size = 1000  # 因為這次的影像較大，緩存空間設1000就好
+bacth_size = 32  # 批次大小
+
+# 載入預處理「 parse_aug_fn」function，cpu數量為自動調整模式
+train_data = train_data.map(map_func=parse_aug_fn, num_parallel_calls=AUTOTUNE)
+train_data = train_data.shuffle(buffer_size)  # 打散資料集
+# 設定批次大小並將prefetch模式開啟(暫存空間為自動調整模式)
+train_data = train_data.batch(bacth_size).prefetch(buffer_size=AUTOTUNE)
+
+# 載入預處理「 parse_fn」function，cpu數量為自動調整模式
+valid_data = valid_data.map(map_func=parse_fn, num_parallel_calls=AUTOTUNE)
+# 設定批次大小並將prefetch模式開啟(暫存空間為自動調整模式)
+valid_data = valid_data.batch(bacth_size).prefetch(buffer_size=AUTOTUNE)
+
+# 載入預處理「 parse_fn」function，cpu數量為自動調整模式
+test_data = test_data.map(map_func=parse_fn, num_parallel_calls=AUTOTUNE)
+# 設定批次大小並將prefetch模式開啟(暫存空間為自動調整模式)
+test_data = test_data.batch(bacth_size).prefetch(buffer_size=AUTOTUNE)
+
+### 訓練Model-1(Random Initialization)
+
+創建模型儲存位置：
+
+# !rm -r lab8-logs  # 移除目錄(以防萬一)
+model_dir = 'lab9-logs/models'  # 設定儲存權重目錄
+os.makedirs(model_dir)  # 創建儲存權重目錄
+
+設定回調函數：
+
+# 儲存訓練記錄檔
+log_dir = os.path.join('lab9-logs', 'model-1')
+model_cbk = keras.callbacks.TensorBoard(log_dir=log_dir)
+# 儲存最好的網路模型權重
+model_mckp = keras.callbacks.ModelCheckpoint(model_dir + '/Best-model-1.h5', 
+                                             monitor='val_binary_accuracy', 
+                                             save_best_only=True, 
+                                             mode='max')
+# 設定停止訓練的條件(當Accuracy超過30迭代沒有上升的話訓練會終止)
+model_esp = keras.callbacks.EarlyStopping(monitor='val_binary_accuracy', patience=20)
+
+創建Inception V3網路模型
+
+# 創建模型(不包含全連接層和預訓練權重)，最後一層卷積加上GlobalAveragePooling
+base_model = tf.keras.applications.InceptionV3(include_top=False, 
+                                               weights=None, 
+                                               pooling='avg', 
+                                               input_shape=input_shape+(3,))
+# 將剛創建的InceptionV3模型接上兩層全連接層，並且最後一層使用Sigmoid輸出
+model_1 = tf.keras.Sequential([
+    base_model,
+    layers.Dense(128, activation='relu'), 
+    layers.Dense(1, activation='sigmoid')
+])
+
+
+透過model.summary查看網路模型資訊
+
+model_1.summary()
+
+設定訓練使用的優化器、損失函數和指標函數
+
+model_1.compile(keras.optimizers.Adam(), 
+                loss=keras.losses.BinaryCrossentropy(), 
+                metrics=[keras.metrics.BinaryAccuracy()])
+
+訓練網路模型
+
+history = model_1.fit(train_data,
+                      epochs=200, 
+                      validation_data=valid_data,
+                      callbacks=[model_cbk, model_mckp, model_esp])
+
+### 訓練Model-2(Transfer Learning)
+
+建立Callback function：
+
+# 儲存訓練記錄檔
+log_dir = os.path.join('lab9-logs', 'model-2')
+model_cbk = keras.callbacks.TensorBoard(log_dir=log_dir)
+# 儲存最好的網路模型權重
+model_mckp = keras.callbacks.ModelCheckpoint(model_dir + '/Best-model-2.h5', 
+                                             monitor='val_binary_accuracy', 
+                                             save_best_only=True, 
+                                             mode='max')
+# 設定停止訓練的條件(當Accuracy超過30迭代沒有上升的話訓練會終止)
+model_esp = keras.callbacks.EarlyStopping(monitor='val_binary_accuracy', patience=20, mode='max')
+
+創建Inception V3網路模型
+
+# 權重檔網址
+module_url = "https://tfhub.dev/google/tf2-preview/inception_v3/feature_vector/4"
+
+model_2 = tf.keras.Sequential([
+    # hub.KerasLayer載入的模型為Keras Layer
+    hub.KerasLayer(module_url,
+                   input_shape=(299, 299, 3),  # 模型輸入大小
+                   output_shape=(2048,),   # 模型輸出打小
+                   trainable=False),  # 將模型訓練權重設定為False(凍結)
+    # 最後接上兩層全連接層，並且輸出使用Sigmoid
+    layers.Dense(128, activation='relu'), 
+    layers.Dense(1, activation='sigmoid')
+])
+
+
+透過model.summary查看網路模型資訊
+
+model_2.summary()
+
+設定訓練使用的優化器、損失函數和指標函數
+
+model_2.compile(keras.optimizers.Adam(), 
+               loss=keras.losses.BinaryCrossentropy(), 
+               metrics=[keras.metrics.BinaryAccuracy()])
+
+訓練網路模型
+
+history = model_2.fit(train_data,
+                      epochs=200, 
+                      validation_data=valid_data,
+                      callbacks=[model_cbk, model_esp, model_mckp])
+
+### 測試Model-1和Model-2
+
+model_1.load_weights(model_dir + '/Best-model-1.h5')
+model_2.load_weights(model_dir + '/Best-model-2.h5')
+
+loss_1, acc_1 = model_1.evaluate(test_data)
+loss_2, acc_2 = model_2.evaluate(test_data)
+
+print("Model_1 Prediction: {}%".format(acc_1 * 100))
+print("Model_2 Prediction: {}%".format(acc_2 * 100))
+
+acc_2 - acc_1
+
